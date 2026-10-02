@@ -2,14 +2,34 @@
 
 #include <opencv2/core.hpp>
 
+extern "C"
+{
+#include <libavutil/frame.h>
+}
+
 namespace camera
 {
+int Frame::width() const
+{
+    return gpuImage ? gpuImage->width : image.cols;
+}
+
+int Frame::height() const
+{
+    return gpuImage ? gpuImage->height : image.rows;
+}
+
 namespace
 {
 class MockVideo final : public Video
 {
 public:
     explicit MockVideo(std::size_t frameCount) : frameCount(frameCount) {}
+
+    std::string description() const override
+    {
+        return "Mock-видео: 4x2, Gray8, 25 FPS, CPU";
+    }
 
     std::optional<Frame> read() override
     {
@@ -34,4 +54,5 @@ std::unique_ptr<Video> createMockVideo(std::size_t frameCount)
 {
     return std::make_unique<MockVideo>(frameCount);
 }
+
 }

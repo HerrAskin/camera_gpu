@@ -1,11 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(CameraDemo VERSION 0.1.0 LANGUAGES CXX)
 
+# Установленный OpenCV использует устаревший FindCUDA; совместимость нужна только ему.
+cmake_policy(PUSH)
+if(POLICY CMP0146)
+    cmake_policy(SET CMP0146 OLD)
+endif()
 find_package(OpenCV REQUIRED COMPONENTS core)
+cmake_policy(POP)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFmpeg REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil)
 
-add_library(camera_core src/core/video.cpp src/core/processor.cpp src/core/writer.cpp)
+add_library(camera_core src/camera/video.cpp src/camera/file_video.cpp src/camera/processor.cpp src/camera/writer.cpp)
 target_include_directories(camera_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(camera_core PUBLIC ${OpenCV_LIBS})
 target_link_libraries(camera_core PRIVATE PkgConfig::FFmpeg)
@@ -17,11 +23,6 @@ endif()
 
 add_executable(camera_demo apps/main.cpp)
 target_link_libraries(camera_demo PRIVATE camera_core)
-
-add_executable(video_info tools/video_info.cpp)
-target_link_libraries(video_info PRIVATE PkgConfig::FFmpeg)
-target_compile_features(video_info PRIVATE cxx_std_17)
-set_target_properties(video_info PROPERTIES CXX_EXTENSIONS OFF)
 
 include(CTest)
 if(BUILD_TESTING)
