@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.20)
+project(CameraDemo VERSION 0.1.0 LANGUAGES CXX)
+
+find_package(OpenCV REQUIRED COMPONENTS core)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFmpeg REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil)
+
+add_library(camera_core src/core/video.cpp src/core/processor.cpp src/core/writer.cpp)
+target_include_directories(camera_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(camera_core PUBLIC ${OpenCV_LIBS})
+target_link_libraries(camera_core PRIVATE PkgConfig::FFmpeg)
+target_compile_features(camera_core PUBLIC cxx_std_17)
+set_target_properties(camera_core PROPERTIES CXX_EXTENSIONS OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(camera_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(camera_demo apps/main.cpp)
+target_link_libraries(camera_demo PRIVATE camera_core)
+
+add_executable(video_info tools/video_info.cpp)
+target_link_libraries(video_info PRIVATE PkgConfig::FFmpeg)
+target_compile_features(video_info PRIVATE cxx_std_17)
+set_target_properties(video_info PROPERTIES CXX_EXTENSIONS OFF)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_pipeline tests/test_pipeline.cpp)
+    target_link_libraries(test_pipeline PRIVATE camera_core)
+    add_test(NAME pipeline COMMAND test_pipeline)
+endif()
