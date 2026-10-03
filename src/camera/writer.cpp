@@ -10,6 +10,7 @@ extern "C"
 }
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace camera
@@ -46,6 +47,11 @@ void Writer::freeCodec(AVCodecContext* context)
 void Writer::freePacket(AVPacket* value)
 {
     av_packet_free(&value);
+}
+
+void Writer::freeFrame(AVFrame* value)
+{
+    av_frame_free(&value);
 }
 
 Writer::~Writer() = default;
@@ -100,27 +106,34 @@ bool Writer::init(const std::filesystem::path& path, Format requestedFormat)
         output.close();
         output.clear();
         formatContext.reset();
-        codecContext.reset();
+        encoderContext.reset();
         std::cerr << "[Writer::init] Ошибка инициализации: " << error.what() << '\n';
         return false;
     }
 }
 
-void Writer::initializeVideo(const Frame& frame)
+void Writer::validateVideoFrame(const Frame& frame)
 {
     if (!frame.gpuImage || !frame.image.empty() || frame.gpuImage->format != AV_PIX_FMT_CUDA || !frame.gpuImage->hw_frames_ctx)
     {
         fail("H264 MP4 требует CUDA frame с hw_frames_ctx");
     }
-    if (frame.width() <= 0 || frame.height() <= 0)
+    if (!frame.timestamp || frame.width() <= 0 || frame.height() <= 0 || frame.gpuImage->time_base.num <= 0 ||
+        frame.gpuImage->time_base.den <= 0 || frame.gpuImage->duration <= 0)
     {
-        fail("Размер кадра должен быть положительным");
+        fail("Timestamp, положительные размеры, исходные time_base и duration обязательны для MP4");
     }
+    if (headerWritten && (frame.width() != encoderContext->width || frame.height() != encoderContext->height ||
+        frame.gpuImage->hw_frames_ctx->buffer != encoderContext->hw_frames_ctx->buffer))
+    {
+        fail("Размер или CUDA hw_frames_ctx изменились во время записи");
+    }
+}
+
+void Writer::openEncoder(const Frame& frame)
+{
+    // Encoder настраивается по первому кадру: размеры и CUDA frame pool задают постоянную конфигурацию.
     const AVFrame& source = *frame.gpuImage;
-    if (!frame.timestamp || source.time_base.num <= 0 || source.time_base.den <= 0 || source.duration <= 0)
-    {
-        fail("Timestamp, исходные time_base и положительная duration обязательны для MP4");
-    }
     const double durationSeconds = av_q2d(source.time_base) * static_cast<double>(source.duration);
     if (durationSeconds <= 0.0)
     {
@@ -136,40 +149,49 @@ void Writer::initializeVideo(const Frame& frame)
     {
         fail("FFmpeg encoder h264_nvenc не найден; CPU fallback отключён");
     }
-    codecContext.reset(avcodec_alloc_context3(encoder));
-    if (!codecContext)
+    encoderContext.reset(avcodec_alloc_context3(encoder));
+    if (!encoderContext)
     {
         fail("Не удалось выделить encoder context");
     }
-    codecContext->width = frame.width();
-    codecContext->height = frame.height();
-    codecContext->pix_fmt = AV_PIX_FMT_CUDA;
-    codecContext->time_base = encoderTimeBase;
-    // Nominal rate нужна encoder/VUI; фактические PTS и длительности задаются для каждого кадра отдельно.
-    codecContext->framerate = nominalFrameRate;
-    codecContext->bit_rate = 2000000;
-    codecContext->max_b_frames = 0;
+    encoderContext->width = frame.width();
+    encoderContext->height = frame.height();
+    encoderContext->pix_fmt = AV_PIX_FMT_CUDA;
+    encoderContext->time_base = encoderTimeBase;
+    // FPS нужен encoder/VUI; кадры сохраняют собственные PTS и duration.
+    encoderContext->framerate = nominalFrameRate;
+    encoderContext->bit_rate = 2000000;
+    encoderContext->max_b_frames = 0;
+    encoderContext->color_range = source.color_range;
+    encoderContext->colorspace = source.colorspace;
+    encoderContext->color_trc = source.color_trc;
+    encoderContext->color_primaries = source.color_primaries;
+    encoderContext->sample_aspect_ratio = source.sample_aspect_ratio;
     if (formatContext->oformat->flags & AVFMT_GLOBALHEADER)
     {
-        codecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        encoderContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
-    codecContext->hw_frames_ctx = av_buffer_ref(frame.gpuImage->hw_frames_ctx);
-    if (!codecContext->hw_frames_ctx)
+    encoderContext->hw_frames_ctx = av_buffer_ref(source.hw_frames_ctx);
+    if (!encoderContext->hw_frames_ctx)
     {
         fail("Не удалось передать CUDA hw_frames_ctx encoder");
     }
-    int result = avcodec_open2(codecContext.get(), encoder, nullptr);
+    const int result = avcodec_open2(encoderContext.get(), encoder, nullptr);
     if (result < 0)
     {
         fail("Открытие h264_nvenc: " + errorText(result));
     }
+}
+
+void Writer::writeHeader()
+{
     AVStream* stream = avformat_new_stream(formatContext.get(), nullptr);
     if (!stream)
     {
         fail("Не удалось создать MP4 video stream");
     }
-    stream->time_base = codecContext->time_base;
-    result = avcodec_parameters_from_context(stream->codecpar, codecContext.get());
+    stream->time_base = encoderContext->time_base;
+    int result = avcodec_parameters_from_context(stream->codecpar, encoderContext.get());
     if (result < 0)
     {
         fail("Копирование параметров encoder: " + errorText(result));
@@ -193,7 +215,7 @@ void Writer::drainPackets(bool flushing)
     const char* operation = flushing ? "Writer::finish" : "Writer::write";
     while (true)
     {
-        const int result = avcodec_receive_packet(codecContext.get(), packet.get());
+        const int result = avcodec_receive_packet(encoderContext.get(), packet.get());
         if (result == AVERROR(EAGAIN))
         {
             if (flushing)
@@ -210,15 +232,17 @@ void Writer::drainPackets(bool flushing)
         {
             fail("Получение encoded packet: " + errorText(result), operation);
         }
-        const auto duration = pendingDurations.find(packet->pts);
-        if (duration == pendingDurations.end())
+        const auto duration = pendingFrameDurations.find(packet->pts);
+        if (duration == pendingFrameDurations.end())
         {
             fail("Encoded packet не соответствует ожидаемому PTS", operation);
         }
         const int64_t packetDuration = duration->second;
-        pendingDurations.erase(duration);
-        av_packet_rescale_ts(packet.get(), codecContext->time_base, stream->time_base);
-        packet->duration = av_rescale_q(packetDuration, codecContext->time_base, stream->time_base);
+        pendingFrameDurations.erase(duration);
+        // Muxer вправе изменить stream time_base после заголовка, поэтому временные поля
+        // packet и сохранённую duration переводим в фактический time_base потока.
+        av_packet_rescale_ts(packet.get(), encoderContext->time_base, stream->time_base);
+        packet->duration = av_rescale_q(packetDuration, encoderContext->time_base, stream->time_base);
         if (packet->duration <= 0)
         {
             fail("Duration кадра потерялась при преобразовании в stream time_base", operation);
@@ -230,6 +254,73 @@ void Writer::drainPackets(bool flushing)
         {
             fail("Запись MP4 packet: " + errorText(muxResult), operation);
         }
+    }
+}
+
+void Writer::writeCsv(const Frame& frame)
+{
+    if (frame.timestamp)
+    {
+        output << frame.timestamp->count();
+    }
+    output << ',' << frame.width() << ',' << frame.height() << '\n';
+}
+
+std::unique_ptr<AVFrame, decltype(&Writer::freeFrame)> Writer::prepareEncoderFrame(const Frame& frame)
+{
+    const AVFrame& source = *frame.gpuImage;
+    const std::int64_t inputPts = av_rescale_q(frame.timestamp->count(), AVRational{1, 1000000}, encoderContext->time_base);
+    std::int64_t outputPts = inputPts;
+    if (lastOutputPts && outputPts <= *lastOutputPts)
+    {
+        if (*lastOutputPts == std::numeric_limits<std::int64_t>::max())
+        {
+            fail("Невозможно скорректировать timestamp после максимального PTS");
+        }
+        // Клонируем кадр, чтобы сделать PTS строго возрастающим и оставить входной Frame неизменным.
+        outputPts = *lastOutputPts + 1;
+    }
+    std::unique_ptr<AVFrame, decltype(&freeFrame)> encoded(av_frame_clone(&source), &freeFrame);
+    if (!encoded)
+    {
+        fail("Не удалось клонировать CUDA frame");
+    }
+    // clone разделяет буферы пикселей по refcount; меняем только метаданные копии кадра.
+    encoded->pts = outputPts;
+    encoded->time_base = encoderContext->time_base;
+    encoded->pict_type = AV_PICTURE_TYPE_NONE;
+    encoded->duration = av_rescale_q(source.duration, source.time_base, encoderContext->time_base);
+    if (encoded->duration <= 0)
+    {
+        fail("Duration кадра потерялась при преобразовании в encoder time_base");
+    }
+    return encoded;
+}
+
+void Writer::writeVideo(const Frame& frame)
+{
+    validateVideoFrame(frame);
+    if (!headerWritten)
+    {
+        openEncoder(frame);
+        writeHeader();
+    }
+    auto encoded = prepareEncoderFrame(frame);
+    if (!pendingFrameDurations.emplace(encoded->pts, encoded->duration).second)
+    {
+        fail("Уникальный PTS для packet duration обязателен");
+    }
+    const int result = avcodec_send_frame(encoderContext.get(), encoded.get());
+    if (result < 0)
+    {
+        pendingFrameDurations.erase(encoded->pts);
+        fail("Передача CUDA frame encoder: " + errorText(result));
+    }
+    drainPackets(false);
+    lastOutputPts = encoded->pts;
+    if (encoded->pts != av_rescale_q(frame.timestamp->count(), AVRational{1, 1000000}, encoderContext->time_base))
+    {
+        ++correctedTimestamps;
     }
 }
 
@@ -247,75 +338,52 @@ void Writer::write(const Frame& frame)
     {
         if (format == Format::Csv)
         {
-            if (frame.timestamp)
-            {
-                output << frame.timestamp->count();
-            }
-            output << ',' << frame.width() << ',' << frame.height() << '\n';
-            return;
+            writeCsv(frame);
         }
-        if (!frame.gpuImage || !frame.image.empty() || frame.gpuImage->format != AV_PIX_FMT_CUDA || !frame.gpuImage->hw_frames_ctx)
+        else
         {
-            fail("H264 MP4 требует CUDA frame с hw_frames_ctx");
+            writeVideo(frame);
         }
-        if (!frame.timestamp)
-        {
-            fail("У CUDA кадра для MP4 отсутствует timestamp");
-        }
-        if (!headerWritten)
-        {
-            initializeVideo(frame);
-        }
-        if (frame.width() != codecContext->width || frame.height() != codecContext->height || !frame.gpuImage || !frame.gpuImage->hw_frames_ctx || frame.gpuImage->format != AV_PIX_FMT_CUDA)
-        {
-            fail("Размер или CUDA representation кадра изменились во время записи");
-        }
-        if (frame.gpuImage->hw_frames_ctx->buffer != codecContext->hw_frames_ctx->buffer)
-        {
-            fail("CUDA hw_frames_ctx изменился во время записи");
-        }
-        const AVFrame& source = *frame.gpuImage;
-        if (source.time_base.num <= 0 || source.time_base.den <= 0 || source.duration <= 0)
-        {
-            fail("Исходные time_base и положительная duration обязательны для MP4");
-        }
-        const int64_t pts = frame.timestamp->count();
-        if (lastPts && pts <= *lastPts)
-        {
-            fail("Timestamp кадра должен строго возрастать");
-        }
-        std::unique_ptr<AVFrame, void (*)(AVFrame*)> encoded(av_frame_clone(&source), [](AVFrame* value) { av_frame_free(&value); });
-        if (!encoded)
-        {
-            fail("Не удалось клонировать CUDA frame");
-        }
-        encoded->pts = av_rescale_q(pts, AVRational{1, 1000000}, codecContext->time_base);
-        encoded->time_base = codecContext->time_base;
-        encoded->pict_type = AV_PICTURE_TYPE_NONE;
-        encoded->duration = av_rescale_q(source.duration, source.time_base, codecContext->time_base);
-        if (encoded->duration <= 0)
-        {
-            fail("Duration кадра потерялась при преобразовании в encoder time_base");
-        }
-        const auto insertedDuration = pendingDurations.emplace(encoded->pts, encoded->duration);
-        if (!insertedDuration.second)
-        {
-            fail("Уникальный PTS для packet duration обязателен");
-        }
-        const int result = avcodec_send_frame(codecContext.get(), encoded.get());
-        if (result < 0)
-        {
-            pendingDurations.erase(insertedDuration.first);
-            fail("Передача CUDA frame encoder: " + errorText(result));
-        }
-        drainPackets(false);
-        lastPts = encoded->pts;
     }
     catch (...)
     {
         failed = true;
         throw;
     }
+}
+
+void Writer::finishVideo()
+{
+    if (!headerWritten)
+    {
+        fail("Нельзя создать MP4 без кадров", "Writer::finish");
+    }
+    // Null frame завершает encoder; затем вычитываем все пакеты перед записью MP4 trailer.
+    const int result = avcodec_send_frame(encoderContext.get(), nullptr);
+    if (result < 0 && result != AVERROR_EOF)
+    {
+        fail("Завершение encoder flush: " + errorText(result), "Writer::finish");
+    }
+    drainPackets(true);
+    if (!pendingFrameDurations.empty())
+    {
+        fail("Encoder не выдал packet для каждого входного кадра", "Writer::finish");
+    }
+    const int trailerResult = av_write_trailer(formatContext.get());
+    if (trailerResult < 0)
+    {
+        fail("Запись MP4 trailer: " + errorText(trailerResult), "Writer::finish");
+    }
+    if (formatContext->pb && !(formatContext->oformat->flags & AVFMT_NOFILE))
+    {
+        const int closeResult = avio_closep(&formatContext->pb);
+        if (closeResult < 0)
+        {
+            fail("Закрытие MP4 output: " + errorText(closeResult), "Writer::finish");
+        }
+    }
+    encoderContext.reset();
+    formatContext.reset();
 }
 
 void Writer::finish()
@@ -336,37 +404,13 @@ void Writer::finish()
         }
         else
         {
-            if (!headerWritten)
-            {
-                fail("Нельзя создать MP4 без кадров", "Writer::finish");
-            }
-            const int result = avcodec_send_frame(codecContext.get(), nullptr);
-            if (result < 0 && result != AVERROR_EOF)
-            {
-                fail("Завершение encoder flush: " + errorText(result), "Writer::finish");
-            }
-            drainPackets(true);
-            if (!pendingDurations.empty())
-            {
-                fail("Encoder не выдал packet для каждого входного кадра", "Writer::finish");
-            }
-            const int trailerResult = av_write_trailer(formatContext.get());
-            if (trailerResult < 0)
-            {
-                fail("Запись MP4 trailer: " + errorText(trailerResult), "Writer::finish");
-            }
-            if (formatContext->pb && !(formatContext->oformat->flags & AVFMT_NOFILE))
-            {
-                const int closeResult = avio_closep(&formatContext->pb);
-                if (closeResult < 0)
-                {
-                    fail("Закрытие MP4 output: " + errorText(closeResult), "Writer::finish");
-                }
-            }
-            codecContext.reset();
-            formatContext.reset();
+            finishVideo();
         }
         finished = true;
+        if (format == Format::H264Mp4 && correctedTimestamps > 0)
+        {
+            std::cout << "[Writer::finish] Скорректировано timestamps: " << correctedTimestamps << '\n';
+        }
         std::cout << "[Writer::finish] запись завершена\n";
     }
     catch (...)

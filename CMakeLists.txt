@@ -29,4 +29,26 @@ if(BUILD_TESTING)
     add_executable(test_pipeline tests/test_pipeline.cpp)
     target_link_libraries(test_pipeline PRIVATE camera_core)
     add_test(NAME pipeline COMMAND test_pipeline)
+
+    if(UNIX)
+        find_package(Threads REQUIRED)
+        add_executable(test_io_cancel tests/test_io_cancel.cpp)
+        target_link_libraries(test_io_cancel PRIVATE camera_core Threads::Threads)
+        add_test(NAME io_cancel COMMAND test_io_cancel)
+        set_tests_properties(io_cancel PROPERTIES TIMEOUT 10)
+    endif()
+
+    option(CAMERA_ENABLE_GPU_TESTS "Enable GPU-backed FFmpeg integration tests" OFF)
+    if(CAMERA_ENABLE_GPU_TESTS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        find_program(FFMPEG_EXECUTABLE NAMES ffmpeg REQUIRED)
+        find_program(FFPROBE_EXECUTABLE NAMES ffprobe REQUIRED)
+        add_test(NAME gpu_pipeline
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_pipeline.py
+                --demo $<TARGET_FILE:camera_demo>
+                --ffmpeg ${FFMPEG_EXECUTABLE}
+                --ffprobe ${FFPROBE_EXECUTABLE}
+                --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/tmp/gpu_pipeline_tests)
+        set_tests_properties(gpu_pipeline PROPERTIES LABELS gpu TIMEOUT 120)
+    endif()
 endif()
