@@ -9,12 +9,14 @@ endif()
 find_package(OpenCV REQUIRED COMPONENTS core)
 cmake_policy(POP)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(FFmpeg REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil)
 
-add_library(camera_core src/camera/video.cpp src/camera/file_video.cpp src/camera/processor.cpp src/camera/writer.cpp)
+add_library(camera_core src/camera/video.cpp src/camera/file_video.cpp src/camera/processor.cpp src/camera/writer.cpp src/camera/frame_queue.cpp)
 target_include_directories(camera_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(camera_core PUBLIC ${OpenCV_LIBS})
 target_link_libraries(camera_core PRIVATE PkgConfig::FFmpeg)
+target_link_libraries(camera_core PUBLIC Threads::Threads)
 target_compile_features(camera_core PUBLIC cxx_std_17)
 set_target_properties(camera_core PROPERTIES CXX_EXTENSIONS OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -30,8 +32,17 @@ if(BUILD_TESTING)
     target_link_libraries(test_pipeline PRIVATE camera_core)
     add_test(NAME pipeline COMMAND test_pipeline)
 
+    add_executable(test_frame_queue tests/test_frame_queue.cpp)
+    target_link_libraries(test_frame_queue PRIVATE camera_core)
+    add_test(NAME frame_queue COMMAND test_frame_queue)
+    set_tests_properties(frame_queue PROPERTIES TIMEOUT 10)
+
+    add_executable(test_writer_queue tests/test_writer_queue.cpp)
+    target_link_libraries(test_writer_queue PRIVATE camera_core)
+    add_test(NAME writer_queue COMMAND test_writer_queue)
+    set_tests_properties(writer_queue PROPERTIES TIMEOUT 10)
+
     if(UNIX)
-        find_package(Threads REQUIRED)
         add_executable(test_io_cancel tests/test_io_cancel.cpp)
         target_link_libraries(test_io_cancel PRIVATE camera_core Threads::Threads)
         add_test(NAME io_cancel COMMAND test_io_cancel)
@@ -40,7 +51,7 @@ if(BUILD_TESTING)
 
     option(CAMERA_ENABLE_GPU_TESTS "Enable GPU-backed FFmpeg integration tests" OFF)
     if(CAMERA_ENABLE_GPU_TESTS)
-        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
         find_program(FFMPEG_EXECUTABLE NAMES ffmpeg REQUIRED)
         find_program(FFPROBE_EXECUTABLE NAMES ffprobe REQUIRED)
         add_test(NAME gpu_pipeline
@@ -50,5 +61,14 @@ if(BUILD_TESTING)
                 --ffprobe ${FFPROBE_EXECUTABLE}
                 --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/tmp/gpu_pipeline_tests)
         set_tests_properties(gpu_pipeline PROPERTIES LABELS gpu TIMEOUT 120)
+        if(UNIX)
+            add_test(NAME rtsp_faults
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rtsp_faults.py
+                    --demo $<TARGET_FILE:camera_demo>
+                    --ffmpeg ${FFMPEG_EXECUTABLE}
+                    --ffprobe ${FFPROBE_EXECUTABLE}
+                    --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/tmp/rtsp_fault_tests)
+            set_tests_properties(rtsp_faults PROPERTIES LABELS "gpu;network" TIMEOUT 120)
+        endif()
     endif()
 endif()

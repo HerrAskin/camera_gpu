@@ -44,6 +44,11 @@ public:
         return frame;
     }
 
+    bool isFinished() const override
+    {
+        return nextFrame == frameCount;
+    }
+
 private:
     std::size_t frameCount;
     std::size_t nextFrame = 0;

@@ -12,6 +12,7 @@ extern "C"
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace camera
 {
@@ -54,7 +55,17 @@ void Writer::freeFrame(AVFrame* value)
     av_frame_free(&value);
 }
 
-Writer::~Writer() = default;
+Writer::~Writer()
+{
+    try
+    {
+        closeWorker();
+    }
+    catch (...)
+    {
+        // Деструктор не выпускает исключения; штатный join возможен только из потока-владельца.
+    }
+}
 
 void Writer::fail(const std::string& message, const char* operation)
 {
@@ -62,7 +73,7 @@ void Writer::fail(const std::string& message, const char* operation)
     throw std::runtime_error(std::string("[") + operation + "] " + message);
 }
 
-bool Writer::init(const std::filesystem::path& path, Format requestedFormat)
+bool Writer::init(const std::filesystem::path& path, Format requestedFormat, std::size_t queueDepth)
 {
     if (initialized)
     {
@@ -97,7 +108,21 @@ bool Writer::init(const std::filesystem::path& path, Format requestedFormat)
             }
         }
         initialized = true;
-        std::cout << "[Writer::init] инициализация успешна\n";
+        if (queueDepth > 0)
+        {
+            queue = std::make_unique<FrameQueue>(queueDepth);
+            asynchronous = true;
+            accepting = true;
+            worker = std::thread(&Writer::runWorker, this);
+        }
+        try
+        {
+            std::cout << "[Writer::init] инициализация успешна\n";
+        }
+        catch (...)
+        {
+            // Логирование не должно превращать уже запущенный worker в частично созданный объект.
+        }
         return true;
     }
     catch (const std::exception& error)
@@ -107,6 +132,20 @@ bool Writer::init(const std::filesystem::path& path, Format requestedFormat)
         output.clear();
         formatContext.reset();
         encoderContext.reset();
+        if (queue)
+        {
+            queue->close();
+            queue.reset();
+        }
+        asynchronous = false;
+        accepting = false;
+        initialized = false;
+        headerWritten = false;
+        finished = false;
+        failed = false;
+        workerException = nullptr;
+        admissionError = nullptr;
+        firstVideoFrameWritten = false;
         std::cerr << "[Writer::init] Ошибка инициализации: " << error.what() << '\n';
         return false;
     }
@@ -324,12 +363,8 @@ void Writer::writeVideo(const Frame& frame)
     }
 }
 
-void Writer::write(const Frame& frame)
+void Writer::writeInternal(const Frame& frame)
 {
-    if (!initialized || failed || finished)
-    {
-        throw std::logic_error("[Writer::write] Writer не готов к записи");
-    }
     if ((!frame.gpuImage && frame.image.empty()) || frame.width() <= 0 || frame.height() <= 0)
     {
         fail("Для записи требуется непустое изображение");
@@ -350,6 +385,115 @@ void Writer::write(const Frame& frame)
         failed = true;
         throw;
     }
+}
+
+void Writer::runWorker() noexcept
+{
+    try
+    {
+        while (true)
+        {
+            auto frame = queue->pop(std::chrono::milliseconds(100));
+            if (frame)
+            {
+                writeInternal(*frame);
+                if (format == Format::H264Mp4)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(lifecycleMutex);
+                        firstVideoFrameWritten = true;
+                    }
+                    lifecycleCondition.notify_all();
+                }
+                continue;
+            }
+            // Последний push и close могли произойти после timeout pop: сначала забираем остаток.
+            if (queue->isClosed() && queue->size() == 0)
+            {
+                return;
+            }
+        }
+    }
+    catch (...)
+    {
+        {
+            std::lock_guard<std::mutex> lock(lifecycleMutex);
+            workerException = std::current_exception();
+            accepting = false;
+            queue->close();
+        }
+        lifecycleCondition.notify_all();
+    }
+}
+
+void Writer::closeWorker()
+{
+    if (queue)
+    {
+        {
+            std::lock_guard<std::mutex> lock(lifecycleMutex);
+            accepting = false;
+            queue->close();
+        }
+    }
+    if (worker.joinable())
+    {
+        worker.join();
+    }
+}
+
+void Writer::write(const Frame& frame)
+{
+    if (asynchronous)
+    {
+        std::unique_lock<std::mutex> lock(lifecycleMutex);
+        if (workerException)
+        {
+            std::rethrow_exception(workerException);
+        }
+        if (admissionError)
+        {
+            std::rethrow_exception(admissionError);
+        }
+        if (!accepting)
+        {
+            throw std::logic_error("[Writer::write] Writer не готов к записи");
+        }
+        try
+        {
+            if (!queue->tryPush(Frame(frame)))
+            {
+                admissionError = std::make_exception_ptr(std::runtime_error("[Writer::write] Очередь Writer переполнена; прием кадров закрыт"));
+                accepting = false;
+                queue->close();
+                std::rethrow_exception(admissionError);
+            }
+        }
+        catch (...)
+        {
+            if (!admissionError)
+            {
+                admissionError = std::current_exception();
+                accepting = false;
+                queue->close();
+            }
+            throw;
+        }
+        if (format == Format::H264Mp4 && !firstVideoFrameWritten)
+        {
+            // Первый кадр открывает NVENC/muxer; дождаться именно его, чтобы startup не забил bounded FIFO.
+            lifecycleCondition.wait(lock, [this]
+            {
+                return firstVideoFrameWritten || workerException;
+            });
+        }
+        return;
+    }
+    if (!initialized || failed || finished)
+    {
+        throw std::logic_error("[Writer::write] Writer не готов к записи");
+    }
+    writeInternal(frame);
 }
 
 void Writer::finishVideo()
@@ -388,12 +532,24 @@ void Writer::finishVideo()
 
 void Writer::finish()
 {
+    if (asynchronous)
+    {
+        closeWorker();
+        if (workerException)
+        {
+            std::rethrow_exception(workerException);
+        }
+    }
     if (!initialized || failed)
     {
         throw std::logic_error("[Writer::finish] Writer не готов к завершению");
     }
     if (finished)
     {
+        if (asynchronous && admissionError)
+        {
+            std::rethrow_exception(admissionError);
+        }
         return;
     }
     try
@@ -417,6 +573,10 @@ void Writer::finish()
     {
         failed = true;
         throw;
+    }
+    if (asynchronous && admissionError)
+    {
+        std::rethrow_exception(admissionError);
     }
 }
 }

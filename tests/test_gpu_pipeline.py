@@ -81,7 +81,8 @@ def assert_video(ffmpeg, ffprobe, path, expected_count, expected_duration):
 
 
 def transcode(demo, source, destination):
-    return run([demo, "--transcode", str(source), str(destination)])
+    # Обе очереди вмещают весь fixture; их общий резерв укладывается в NVDEC на тестовом GPU.
+    return run([demo, "--queue-depth", "10", "--write-queue-depth", "10", "--transcode", str(source), str(destination)])
 
 
 def check_corrected_count(output, expected):

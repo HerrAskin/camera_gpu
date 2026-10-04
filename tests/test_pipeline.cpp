@@ -3,9 +3,13 @@
 #include "camera/writer.hpp"
 
 #include <filesystem>
+#include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <stdexcept>
+#include <thread>
 
 namespace
 {
@@ -36,6 +40,8 @@ void testFileVideoLifecycle()
     camera::FileVideo file;
     requireThrows<std::logic_error>([&] { file.read(); }, "Read before init must throw");
     require(!file.init(""), "Invalid input must return false");
+    require(!file.init("", std::chrono::seconds(10), 0), "Zero queue depth must be rejected");
+    require(!file.init("", std::chrono::seconds(10), 8, std::numeric_limits<std::size_t>::max()), "GPU frame reservation overflow must be rejected");
     require(!file.init(""), "Failed init must release partial state");
     requireThrows<std::logic_error>([&] { file.read(); }, "Read after failed init must throw");
     requireThrows<std::logic_error>([&] { file.description(); }, "Failed init must not leave a ready object");
@@ -103,13 +109,26 @@ void testMp4RejectsCpuFrames(const std::filesystem::path& testOutput)
 
 void testGpuFileVideo(const std::string& path, int expectedCount)
 {
+    require(expectedCount > 0, "GPU integration frame count must be positive");
     auto gpuVideo = std::make_unique<camera::FileVideo>();
-    require(gpuVideo->init(path), "GPU integration input must initialize");
+    require(gpuVideo->init(path, std::chrono::seconds(10), static_cast<std::size_t>(expectedCount + 2)), "GPU integration input must initialize");
     camera::Frame gpuRetained;
     camera::Frame gpuRetainedCopy;
     int count = 0;
-    while (auto frame = gpuVideo->read())
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (true)
     {
+        auto frame = gpuVideo->read();
+        if (!frame)
+        {
+            if (gpuVideo->isFinished())
+            {
+                break;
+            }
+            require(std::chrono::steady_clock::now() < deadline, "GPU input did not finish within 10 seconds");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
         require(frame->gpuImage && frame->image.empty(), "FileVideo must return GPU-only frame");
         require(frame->width() == 640 && frame->height() == 360, "GPU frame size mismatch");
         require(frame->timestamp && frame->timestamp->count() == count * 100000, "GPU timestamp mismatch");
@@ -127,6 +146,40 @@ void testGpuFileVideo(const std::string& path, int expectedCount)
     gpuVideo.reset();
     require(gpuRetainedCopy.width() == 640 && gpuRetainedCopy.height() == 360, "GPU surface copy must outlive FileVideo");
 }
+
+void testGpuFileVideoStopAndDrop(const std::string& path, int expectedCount)
+{
+    require(expectedCount > 0, "GPU drop-test frame count must be positive");
+    const auto stopStart = std::chrono::steady_clock::now();
+    {
+        camera::FileVideo stoppedVideo;
+        require(stoppedVideo.init(path), "GPU stop input must initialize");
+        stoppedVideo.requestStop();
+        // Деструктор обязан закрыть очередь и присоединить worker, даже если кадры ещё не прочитаны.
+    }
+    require(std::chrono::steady_clock::now() - stopStart < std::chrono::seconds(3), "GPU stop and destruction must finish within 3 seconds");
+
+    camera::FileVideo droppingVideo;
+    require(droppingVideo.init(path, std::chrono::seconds(10), 1), "GPU drop input must initialize");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (droppingVideo.droppedCount() < static_cast<std::size_t>(expectedCount - 1))
+    {
+        require(std::chrono::steady_clock::now() < deadline, "GPU worker did not fill the bounded queue within 3 seconds");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::optional<camera::Frame> lastFrame;
+    while (!lastFrame)
+    {
+        lastFrame = droppingVideo.read();
+        if (!lastFrame)
+        {
+            require(std::chrono::steady_clock::now() < deadline, "GPU worker did not produce the retained frame within 3 seconds");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    const bool retainedLatestFrame = lastFrame && lastFrame->timestamp && lastFrame->timestamp->count() == (expectedCount - 1) * 100000;
+    require(retainedLatestFrame, "Drop-oldest queue must retain the newest GPU frame");
+}
 }
 
 int main(int argc, char* argv[])
@@ -142,6 +195,7 @@ int main(int argc, char* argv[])
         {
             const int expectedCount = argc >= 3 ? std::stoi(argv[2]) : 10;
             testGpuFileVideo(argv[1], expectedCount);
+            testGpuFileVideoStopAndDrop(argv[1], expectedCount);
         }
         std::cout << "Video checks passed\n";
         return 0;

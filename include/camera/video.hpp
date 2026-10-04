@@ -28,13 +28,19 @@ struct Frame
     int height() const;
 };
 
-/** Источник кадров. read() возвращает nullopt при штатном EOF и бросает исключение при ошибке. */
+/** Источник кадров. read() извлекает уже готовый кадр без ожидания; nullopt означает, что
+ * сейчас очередь пуста. isFinished() различает временную пустоту и конец источника.
+ */
 class Video
 {
 public:
     virtual ~Video() = default;
-    /** Читает следующий кадр; nullopt означает EOF. */
+    /** Извлекает готовый кадр без ожидания; nullopt означает пустую очередь. */
     virtual std::optional<Frame> read() = 0;
+    /** Сообщает, что источник закончил работу и готовых кадров больше нет. */
+    virtual bool isFinished() const = 0;
+    /** Запрашивает остановку; источник без worker-потока может ничего не делать. */
+    virtual void requestStop() noexcept {}
     /** Возвращает описание уже настроенного источника. */
     virtual std::string description() const = 0;
 };

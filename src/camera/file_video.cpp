@@ -15,6 +15,7 @@ extern "C"
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace camera
 {
@@ -90,6 +91,14 @@ void FileVideo::requestStop() noexcept
     stopRequested.store(true, std::memory_order_relaxed);
 }
 
+void FileVideo::joinReader() noexcept
+{
+    if (readerThread.joinable())
+    {
+        readerThread.join();
+    }
+}
+
 void FileVideo::closeInput(AVFormatContext* context)
 {
     avformat_close_input(&context);
@@ -103,6 +112,12 @@ void FileVideo::releaseDevice(AVBufferRef* device)
 void FileVideo::closeDecoder(AVCodecContext* decoder)
 {
     avcodec_free_context(&decoder);
+}
+
+FileVideo::~FileVideo()
+{
+    requestStop();
+    joinReader();
 }
 
 void FileVideo::openInput(const std::string& path)
@@ -152,7 +167,7 @@ void FileVideo::createCudaDevice()
     check(result, "Создание CUDA-контекста");
 }
 
-void FileVideo::openDecoder()
+void FileVideo::openDecoder(std::size_t queueDepth)
 {
     const AVStream* stream = formatContext->streams[streamIndex];
     const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
@@ -182,6 +197,8 @@ void FileVideo::openDecoder()
     check(avcodec_parameters_to_context(decoderContext.get(), stream->codecpar), "Передача параметров codec");
     decoderContext->pkt_timebase = stream->time_base;
     decoderContext->get_format = selectCudaFormat;
+    // Очередь удерживает GPU-поверхности; резервируем поверхности для decoder и текущего кадра.
+    decoderContext->extra_hw_frames = static_cast<int>(queueDepth + 2);
     // Decoder удерживает отдельную ссылку на то же устройство.
     decoderContext->hw_device_ctx = av_buffer_ref(cudaDevice.get());
     if (!decoderContext->hw_device_ctx)
@@ -191,9 +208,9 @@ void FileVideo::openDecoder()
     check(avcodec_open2(decoderContext.get(), codec, nullptr), "Открытие decoder");
 }
 
-bool FileVideo::init(const std::string& path, std::chrono::milliseconds timeout)
+bool FileVideo::init(const std::string& path, std::chrono::milliseconds timeout, std::size_t queueDepth, std::size_t additionalHeldFrames)
 {
-    if (formatContext)
+    if (initialized || readerThread.joinable())
     {
         std::cerr << "[FileVideo::init] Ошибка инициализации: объект уже инициализирован\n";
         return false;
@@ -203,16 +220,38 @@ bool FileVideo::init(const std::string& path, std::chrono::milliseconds timeout)
         std::cerr << "[FileVideo::init] Ошибка инициализации: ioTimeout должен быть больше нуля\n";
         return false;
     }
+    const auto maxReservedFrames = static_cast<std::size_t>(std::numeric_limits<int>::max() - 2);
+    if (queueDepth == 0 || queueDepth > maxReservedFrames || additionalHeldFrames > maxReservedFrames - queueDepth)
+    {
+        std::cerr << "[FileVideo::init] Ошибка инициализации: queueDepth вне допустимого диапазона\n";
+        return false;
+    }
     ioTimeout = timeout;
     stopRequested.store(false, std::memory_order_relaxed);
+    liveInput = path.rfind("rtsp://", 0) == 0;
     try
     {
+        frameQueue = std::make_unique<FrameQueue>(queueDepth);
+        {
+            std::lock_guard<std::mutex> lock(readerErrorMutex);
+            readerError = nullptr;
+        }
         openInput(path);
         createCudaDevice();
-        openDecoder();
+        // Обе очереди удерживают ссылки на один GPU frame pool; учитываем их суммарную вместимость.
+        openDecoder(queueDepth + additionalHeldFrames);
         draining = false;
         ended = false;
-        std::cout << "[FileVideo::init] инициализация успешна\n";
+        readerThread = std::thread(&FileVideo::readerLoop, this);
+        initialized = true;
+        try
+        {
+            std::cout << "[FileVideo::init] инициализация успешна\n";
+        }
+        catch (...)
+        {
+            // Ошибка вывода не должна заставить init освободить ресурсы работающего worker.
+        }
         return true;
     }
     catch (const std::exception& error)
@@ -224,6 +263,8 @@ bool FileVideo::init(const std::string& path, std::chrono::milliseconds timeout)
         streamIndex = -1;
         draining = false;
         ended = false;
+        liveInput = false;
+        frameQueue.reset();
         std::cerr << "[FileVideo::init] Ошибка инициализации: " << error.what() << '\n';
         return false;
     }
@@ -291,7 +332,7 @@ Frame FileVideo::makeFrame(std::shared_ptr<AVFrame> frame) const
     return result;
 }
 
-std::optional<Frame> FileVideo::read()
+std::optional<Frame> FileVideo::decodeFrame()
 {
     if (!decoderContext || !avcodec_is_open(decoderContext.get()) || !formatContext || streamIndex < 0)
     {
@@ -340,6 +381,10 @@ std::optional<Frame> FileVideo::read()
         {
             // nullopt возвращается только после выдачи decoder всех задержанных кадров.
             ended = true;
+            if (liveInput)
+            {
+                throw std::runtime_error("[FileVideo::read] RTSP-соединение неожиданно завершено");
+            }
             return std::nullopt;
         }
         if (receiveResult != AVERROR(EAGAIN))
@@ -352,6 +397,71 @@ std::optional<Frame> FileVideo::read()
         }
         feedDecoder(packet.get());
     }
+}
+
+void FileVideo::readerLoop() noexcept
+{
+    try
+    {
+        while (!stopRequested.load(std::memory_order_relaxed))
+        {
+            auto frame = decodeFrame();
+            if (!frame)
+            {
+                break;
+            }
+            if (!frameQueue->push(std::move(*frame)))
+            {
+                break;
+            }
+        }
+    }
+    catch (...)
+    {
+        if (!stopRequested.load(std::memory_order_relaxed))
+        {
+            std::lock_guard<std::mutex> lock(readerErrorMutex);
+            readerError = std::current_exception();
+        }
+    }
+    frameQueue->close();
+}
+
+std::optional<Frame> FileVideo::read()
+{
+    if (!initialized || !frameQueue)
+    {
+        throw std::logic_error("[FileVideo::read] Сначала успешно вызови FileVideo::init()");
+    }
+    auto frame = frameQueue->pop();
+    if (frame)
+    {
+        return frame;
+    }
+    std::lock_guard<std::mutex> lock(readerErrorMutex);
+    if (readerError)
+    {
+        std::rethrow_exception(readerError);
+    }
+    return std::nullopt;
+}
+
+bool FileVideo::isFinished() const
+{
+    if (!initialized || !frameQueue)
+    {
+        throw std::logic_error("[FileVideo::isFinished] Сначала успешно вызови FileVideo::init()");
+    }
+    return frameQueue->isClosed() && frameQueue->size() == 0;
+}
+
+std::size_t FileVideo::droppedCount() const
+{
+    if (!initialized || !frameQueue)
+    {
+        throw std::logic_error("[FileVideo::droppedCount] Сначала успешно вызови FileVideo::init()");
+    }
+    return frameQueue->droppedCount();
 }
 
 std::string FileVideo::description() const
