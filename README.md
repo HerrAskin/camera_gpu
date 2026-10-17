@@ -1,4 +1,4 @@
-/# Camera Demo
+## Camera Demo
 
 Учебный C++17 видеоконвейер для Linux: захват RTSP по TCP → GPU-декодирование
 через NVIDIA NVDEC → Processor → GPU-кодирование через NVENC → H.264 MP4.
