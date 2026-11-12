@@ -176,6 +176,25 @@ def main() -> None:
     assert (partial_dir / "video2_out.mp4").is_file(), partial.stderr
     verify_output(ffmpeg, ffprobe, partial_dir / "video2_out.mp4")
 
+    invalid_output = run_dir / "output_is_directory.mp4"
+    invalid_output.mkdir()
+    failed_output = run([
+        *cpu, "--source", str(first), "--output", str(invalid_output),
+    ], expected=1)
+    assert "Открытие MP4" in failed_output.stderr, failed_output.stderr
+    assert "результат сохранён" not in failed_output.stdout, failed_output.stdout
+    assert "запись завершена" not in failed_output.stdout, failed_output.stdout
+    assert invalid_output.is_dir(), "Ошибка открытия output не должна повредить каталог"
+
+    surviving_output = run_dir / "surviving_writer.mp4"
+    failed_writer = run([
+        *cpu, "--source", str(first), "--output", str(invalid_output),
+        "--source", str(second), "--output", str(surviving_output),
+    ], expected=1)
+    assert "Открытие MP4" in failed_writer.stderr, failed_writer.stderr
+    assert f"результат сохранён: {invalid_output}" not in failed_writer.stdout, failed_writer.stdout
+    verify_output(ffmpeg, ffprobe, surviving_output)
+
     for flags in (["--source"], ["--output", "tmp/no-source.mp4"], ["--source", str(first), "--output", "a.mp4", "--output", "b.mp4"]):
         run([demo, *flags], expected=1)
 

@@ -3,13 +3,16 @@
 extern "C"
 {
 #include <libavcodec/avcodec.h>
+#include <libavutil/error.h>
 }
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -46,6 +49,116 @@ std::vector<std::string> readLines(const std::filesystem::path& path)
     }
     require(input.eof(), "Ошибка чтения итогового CSV");
     return lines;
+}
+
+camera::Frame makeVideoFrame()
+{
+    camera::Frame frame;
+    frame.image = cv::Mat(128, 128, CV_8UC3, cv::Scalar(20, 80, 160));
+    frame.timestamp = std::chrono::microseconds(0);
+    frame.duration = std::chrono::microseconds(40000);
+    return frame;
+}
+
+class CaptureOutput
+{
+public:
+    CaptureOutput() : previous(std::cout.rdbuf(output.rdbuf()))
+    {
+    }
+    ~CaptureOutput()
+    {
+        std::cout.rdbuf(previous);
+    }
+    std::ostringstream output;
+
+private:
+    std::streambuf* previous;
+};
+
+template<typename Exception = std::exception, typename Operation>
+std::string exceptionMessage(Operation operation)
+{
+    try
+    {
+        operation();
+    }
+    catch (const Exception& error)
+    {
+        return error.what();
+    }
+    return {};
+}
+
+void testMp4FailedInitRecovery()
+{
+    const auto directory = outputDirectory / "init_directory";
+    std::filesystem::create_directories(directory);
+    const auto missingParent = outputDirectory / ("missing_" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    require(!std::filesystem::exists(missingParent), "Родитель MP4 должен отсутствовать");
+    for (const std::size_t depth : {0, 2})
+    {
+        camera::VideoWriter writer;
+        const camera::VideoWriter::Options options{camera::VideoWriter::Format::H264Mp4, depth, false};
+        require(!writer.init(directory, options), "MP4 init на каталог должен вернуть false");
+        require(!writer.init(missingParent / "output.mp4", options), "MP4 init без родителя должен вернуть false");
+        require(writer.outputPaths().empty(), "Failed init не должен публиковать output paths");
+        require(!exceptionMessage([&] { writer.write(makeVideoFrame()); }).empty(), "Write после failed init должен отклоняться");
+        require(!exceptionMessage([&] { writer.finish(); }).empty(), "Finish после failed init должен отклоняться");
+        if (!avcodec_find_encoder_by_name("libx264"))
+        {
+            std::cout << "Skipping CPU MP4 recovery checks: FFmpeg libx264 encoder is unavailable\n";
+            continue;
+        }
+        const auto recovered = outputDirectory / ("recovered_" + std::to_string(depth) + ".mp4");
+        require(writer.init(recovered, options), "MP4 init должен восстановиться после ошибок открытия");
+        writer.write(makeVideoFrame());
+        writer.finish();
+        require(writer.outputPaths() == std::vector<std::filesystem::path>{recovered}, "Recovery должен публиковать только успешный output");
+        require(std::filesystem::file_size(recovered) > 0, "Recovery MP4 должен содержать output");
+    }
+}
+
+void testFullDeviceErrors()
+{
+#ifdef __linux__
+    require(std::filesystem::is_character_file("/dev/full"), "/dev/full должен быть символьным устройством");
+    for (const auto format : {camera::VideoWriter::Format::Csv, camera::VideoWriter::Format::H264Mp4})
+    {
+        if (format == camera::VideoWriter::Format::H264Mp4 && !avcodec_find_encoder_by_name("libx264"))
+        {
+            std::cout << "Skipping CPU MP4 I/O checks: FFmpeg libx264 encoder is unavailable\n";
+            continue;
+        }
+        for (const std::size_t depth : {0, 2})
+        {
+            CaptureOutput captured;
+            camera::VideoWriter writer;
+            require(writer.init("/dev/full", camera::VideoWriter::Options{format, depth, false}), "/dev/full должен открываться для записи");
+            const auto frame = makeVideoFrame();
+            const auto write = [&] { writer.write(frame); };
+            const auto finish = [&] { writer.finish(); };
+            const auto writeError = format == camera::VideoWriter::Format::Csv
+                ? exceptionMessage<std::ios_base::failure>(write) : exceptionMessage(write);
+            const auto finishError = format == camera::VideoWriter::Format::Csv && writeError.empty()
+                ? exceptionMessage<std::ios_base::failure>(finish) : exceptionMessage(finish);
+            require(!finishError.empty(), "Finish обязан сообщить об ошибке /dev/full");
+            const auto& firstError = writeError.empty() ? finishError : writeError;
+            if (format == camera::VideoWriter::Format::H264Mp4)
+            {
+                char noSpace[AV_ERROR_MAX_STRING_SIZE]{};
+                av_strerror(AVERROR(ENOSPC), noSpace, sizeof(noSpace));
+                require(firstError.find(noSpace) != std::string::npos, "MP4 должен сообщить ENOSPC, а не validation/queue error");
+            }
+            require(!exceptionMessage([&] { writer.write(frame); }).empty(), "Повторный write после I/O error должен отклоняться");
+            require(!exceptionMessage([&] { writer.finish(); }).empty(), "Повторный finish после I/O error должен отклоняться");
+            require(captured.output.str().find("запись завершена") == std::string::npos, "I/O error не должен логировать успешное завершение");
+        }
+    }
+#else
+    std::cout << "Skipping /dev/full checks: Linux is required\n";
+#endif
 }
 
 void testAsyncFifoAndLifecycle()
@@ -245,6 +358,8 @@ int main()
     try
     {
         std::filesystem::create_directories(outputDirectory);
+        testMp4FailedInitRecovery();
+        testFullDeviceErrors();
         testAsyncFifoAndLifecycle();
         testDefaultSynchronousMode();
         testDestructorDrainsAndJoins();
