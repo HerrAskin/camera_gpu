@@ -89,6 +89,69 @@ void testRejectOverflow()
     require(frameId(*queue.pop()) == 2 && frameId(*queue.pop()) == 4, "Закрытая очередь сохраняет FIFO");
 }
 
+void testWaitPushTimeoutAndValidation()
+{
+    camera::FrameQueue queue(1);
+    require(queue.waitPush(makeFrame(30), std::chrono::milliseconds::zero()), "waitPush должен сразу принимать кадр при наличии места");
+    const auto start = std::chrono::steady_clock::now();
+    require(!queue.waitPush(makeFrame(31), std::chrono::milliseconds(30)), "Полная очередь должна вернуть timeout для waitPush");
+    require(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(20), "waitPush должен ждать заданный timeout");
+    require(queue.size() == 1 && queue.droppedCount() == 0, "Timeout не должен менять принятую очередь или счетчик потерь");
+    bool rejectedNegative = false;
+    try
+    {
+        queue.waitPush(makeFrame(32), std::chrono::milliseconds(-1));
+    }
+    catch (const std::invalid_argument&)
+    {
+        rejectedNegative = true;
+    }
+    require(rejectedNegative, "Отрицательный timeout waitPush должен отклоняться");
+    require(frameId(*queue.pop()) == 30, "Timeout не должен заменять уже принятый кадр");
+}
+
+void testWaitPushWakesOnPopAndPreservesFifo()
+{
+    camera::FrameQueue queue(1);
+    queue.push(makeFrame(40));
+    std::promise<void> starting;
+    auto started = starting.get_future();
+    auto result = std::async(std::launch::async, [&queue, &starting]
+    {
+        starting.set_value();
+        return queue.waitPush(makeFrame(41), std::chrono::seconds(5));
+    });
+    started.wait();
+    require(frameId(*queue.pop()) == 40, "Извлечение должно освободить место ожидающему производителю");
+    const auto status = result.wait_for(std::chrono::seconds(1));
+    if (status != std::future_status::ready)
+    {
+        queue.close();
+    }
+    require(status == std::future_status::ready && result.get(), "pop должен разбудить ожидающий waitPush");
+    require(frameId(*queue.pop()) == 41, "waitPush должен добавить новый кадр после ранее принятого");
+    require(queue.droppedCount() == 0, "waitPush не должен отбрасывать кадры");
+}
+
+void testCloseWakesWaitingProducer()
+{
+    camera::FrameQueue queue(1);
+    queue.push(makeFrame(50));
+    std::promise<void> starting;
+    auto started = starting.get_future();
+    auto result = std::async(std::launch::async, [&queue, &starting]
+    {
+        starting.set_value();
+        return queue.waitPush(makeFrame(51), std::chrono::seconds(5));
+    });
+    started.wait();
+    queue.close();
+    const auto status = result.wait_for(std::chrono::seconds(1));
+    require(status == std::future_status::ready, "close должен разбудить ожидающего производителя");
+    require(!result.get(), "Ожидающий производитель должен получить false после close");
+    require(frameId(*queue.pop()) == 50 && !queue.pop(), "close должен сохранить прежнюю очередь без добавления ожидавшего кадра");
+}
+
 void testTimeoutAndCloseDrain()
 {
     camera::FrameQueue queue(2);
@@ -208,6 +271,9 @@ int main()
     {
         testCapacityAndLatestFrames();
         testRejectOverflow();
+        testWaitPushTimeoutAndValidation();
+        testWaitPushWakesOnPopAndPreservesFifo();
+        testCloseWakesWaitingProducer();
         testTimeoutAndCloseDrain();
         testCloseWakesWaitingConsumer();
         testPushWakesWaitingConsumer();

@@ -1,0 +1,42 @@
+name: CPU CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ pkg-config python3 ffmpeg libopencv-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCAMERA_ENABLE_CPU_TESTS=ON -DCAMERA_ENABLE_GPU_TESTS=OFF
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Run CPU tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error -R '^(pipeline|frame_queue|writer_queue|io_cancel|cpu_pipeline|multi_source)$'
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-test-diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            build/Testing/Temporary/
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            tmp/cpu_pipeline_tests/
+            tmp/multi_source_tests/
+            tmp/writer_tests/
+            tmp/writer_queue_tests/

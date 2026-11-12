@@ -1,6 +1,7 @@
-#include "camera/file_video.hpp"
+#include "camera/video_capture.hpp"
 #include "camera/processor.hpp"
-#include "camera/writer.hpp"
+#include "camera/mock_capture.hpp"
+#include "camera/video_writer.hpp"
 
 #include <filesystem>
 #include <chrono>
@@ -35,13 +36,20 @@ void requireThrows(Function&& function, const char* message)
     throw std::runtime_error(message);
 }
 
-void testFileVideoLifecycle()
+void testVideoCaptureLifecycle()
 {
-    camera::FileVideo file;
+    camera::VideoCapture file;
+    camera::VideoCapture::Options options;
+    options.preferGpu = false;
     requireThrows<std::logic_error>([&] { file.read(); }, "Read before init must throw");
-    require(!file.init(""), "Invalid input must return false");
-    require(!file.init("", std::chrono::seconds(10), 0), "Zero queue depth must be rejected");
-    require(!file.init("", std::chrono::seconds(10), 8, std::numeric_limits<std::size_t>::max()), "GPU frame reservation overflow must be rejected");
+    require(!file.init("", options), "Invalid input must return false");
+    options.queueDepth = 0;
+    require(!file.init("", options), "Zero queue depth must be rejected");
+    options.queueDepth = 8;
+    options.additionalHeldFrames = std::numeric_limits<std::size_t>::max();
+    require(!file.init("", options), "Frame reservation overflow must be rejected");
+    require(!file.init("", std::chrono::seconds(10), 0), "Legacy overload must reject zero queue depth");
+    require(!file.init("", std::chrono::seconds(10), 8, std::numeric_limits<std::size_t>::max()), "Legacy overload must reject reservation overflow");
     require(!file.init(""), "Failed init must release partial state");
     requireThrows<std::logic_error>([&] { file.read(); }, "Read after failed init must throw");
     requireThrows<std::logic_error>([&] { file.description(); }, "Failed init must not leave a ready object");
@@ -49,7 +57,7 @@ void testFileVideoLifecycle()
 
 void testMockVideoAndProcessor()
 {
-    auto video = camera::createMockVideo(3);
+    auto video = camera::createMockCapture(3);
     camera::Processor processor;
     camera::Frame retained;
     for (int index = 0; index < 3; ++index)
@@ -68,7 +76,7 @@ void testMockVideoAndProcessor()
     video.reset();
     require(retained.image.at<unsigned char>(0, 0) == 42, "Frame lifetime mismatch");
     require(retained.width() == 4 && retained.height() == 2, "Copied CPU frame size mismatch");
-    auto empty = camera::createMockVideo(0);
+    auto empty = camera::createMockCapture(0);
     require(!empty->read(), "Empty video must return EOF");
 }
 
@@ -82,7 +90,7 @@ std::filesystem::path testOutputDirectory()
 void testCsvWriter(const std::filesystem::path& testOutput)
 {
     const auto csvPath = testOutput / "metadata.csv";
-    camera::Writer csvWriter;
+    camera::VideoWriter csvWriter;
     require(!csvWriter.init(testOutput / "missing" / "metadata.csv"), "CSV init must report open failure");
     require(csvWriter.init(csvPath), "CSV writer must be retryable after failed init");
     camera::Frame noTimestamp;
@@ -99,19 +107,22 @@ void testCsvWriter(const std::filesystem::path& testOutput)
 
 void testMp4RejectsCpuFrames(const std::filesystem::path& testOutput)
 {
-    camera::Writer mp4Writer;
-    require(mp4Writer.init(testOutput / "cpu_input.mp4", camera::Writer::Format::H264Mp4), "MP4 output init must succeed without opening encoder");
+    camera::VideoWriter mp4Writer;
+    require(mp4Writer.init(testOutput / "cpu_input.mp4", camera::VideoWriter::Options{camera::VideoWriter::Format::H264Mp4, 0, false}), "MP4 output init must succeed without opening encoder");
     camera::Frame noTimestamp;
     noTimestamp.image = cv::Mat(2, 4, CV_8UC1, cv::Scalar(0));
-    requireThrows<std::runtime_error>([&] { mp4Writer.write(noTimestamp); }, "MP4 writer must reject CPU frames");
+    requireThrows<std::runtime_error>([&] { mp4Writer.write(noTimestamp); }, "MP4 writer must reject untimed CPU frames");
     requireThrows<std::logic_error>([&] { mp4Writer.finish(); }, "Failed MP4 writer must not finish a corrupt file");
 }
 
-void testGpuFileVideo(const std::string& path, int expectedCount)
+void testGpuVideoCapture(const std::string& path, int expectedCount)
 {
     require(expectedCount > 0, "GPU integration frame count must be positive");
-    auto gpuVideo = std::make_unique<camera::FileVideo>();
-    require(gpuVideo->init(path, std::chrono::seconds(10), static_cast<std::size_t>(expectedCount + 2)), "GPU integration input must initialize");
+    auto gpuVideo = std::make_unique<camera::VideoCapture>();
+    camera::VideoCapture::Options options;
+    options.ioTimeout = std::chrono::seconds(10);
+    options.queueDepth = static_cast<std::size_t>(expectedCount + 2);
+    require(gpuVideo->init(path, options), "GPU integration input must initialize");
     camera::Frame gpuRetained;
     camera::Frame gpuRetainedCopy;
     int count = 0;
@@ -129,7 +140,7 @@ void testGpuFileVideo(const std::string& path, int expectedCount)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
-        require(frame->gpuImage && frame->image.empty(), "FileVideo must return GPU-only frame");
+        require(frame->gpuImage && frame->image.empty(), "VideoCapture must return GPU-only frame");
         require(frame->width() == 640 && frame->height() == 360, "GPU frame size mismatch");
         require(frame->timestamp && frame->timestamp->count() == count * 100000, "GPU timestamp mismatch");
         if (count == 0)
@@ -144,23 +155,26 @@ void testGpuFileVideo(const std::string& path, int expectedCount)
     gpuRetained.gpuImage.reset();
     require(gpuRetainedCopy.gpuImage && gpuRetainedCopy.width() == 640 && gpuRetainedCopy.height() == 360, "GPU surface copy must outlive original Frame copy");
     gpuVideo.reset();
-    require(gpuRetainedCopy.width() == 640 && gpuRetainedCopy.height() == 360, "GPU surface copy must outlive FileVideo");
+    require(gpuRetainedCopy.width() == 640 && gpuRetainedCopy.height() == 360, "GPU surface copy must outlive VideoCapture");
 }
 
-void testGpuFileVideoStopAndDrop(const std::string& path, int expectedCount)
+void testGpuVideoCaptureStopAndDrop(const std::string& path, int expectedCount)
 {
     require(expectedCount > 0, "GPU drop-test frame count must be positive");
     const auto stopStart = std::chrono::steady_clock::now();
     {
-        camera::FileVideo stoppedVideo;
+        camera::VideoCapture stoppedVideo;
         require(stoppedVideo.init(path), "GPU stop input must initialize");
         stoppedVideo.requestStop();
         // Деструктор обязан закрыть очередь и присоединить worker, даже если кадры ещё не прочитаны.
     }
     require(std::chrono::steady_clock::now() - stopStart < std::chrono::seconds(3), "GPU stop and destruction must finish within 3 seconds");
 
-    camera::FileVideo droppingVideo;
-    require(droppingVideo.init(path, std::chrono::seconds(10), 1), "GPU drop input must initialize");
+    camera::VideoCapture droppingVideo;
+    camera::VideoCapture::Options options;
+    options.ioTimeout = std::chrono::seconds(10);
+    options.queueDepth = 1;
+    require(droppingVideo.init(path, options), "GPU drop input must initialize");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (droppingVideo.droppedCount() < static_cast<std::size_t>(expectedCount - 1))
     {
@@ -186,7 +200,7 @@ int main(int argc, char* argv[])
 {
     try
     {
-        testFileVideoLifecycle();
+        testVideoCaptureLifecycle();
         testMockVideoAndProcessor();
         const auto testOutput = testOutputDirectory();
         testCsvWriter(testOutput);
@@ -194,8 +208,8 @@ int main(int argc, char* argv[])
         if (argc >= 2)
         {
             const int expectedCount = argc >= 3 ? std::stoi(argv[2]) : 10;
-            testGpuFileVideo(argv[1], expectedCount);
-            testGpuFileVideoStopAndDrop(argv[1], expectedCount);
+            testGpuVideoCapture(argv[1], expectedCount);
+            testGpuVideoCaptureStopAndDrop(argv[1], expectedCount);
         }
         std::cout << "Video checks passed\n";
         return 0;

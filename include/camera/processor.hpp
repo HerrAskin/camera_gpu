@@ -1,6 +1,6 @@
 #pragma once
 
-#include "camera/video.hpp"
+#include "camera/frame.hpp"
 
 namespace camera
 {
@@ -9,6 +9,9 @@ class Processor
 {
 public:
     /** Обрабатывает кадр; текущая mock-реализация ничего не меняет. */
-    void process(Frame& frame);
+    void process(Frame& /*frame*/)
+    {
+        // Полезная обработка будет добавлена на следующем этапе.
+    }
 };
 }

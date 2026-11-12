@@ -1,6 +1,12 @@
-#include "camera/writer.hpp"
+#include "camera/video_writer.hpp"
+
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+}
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -45,8 +51,8 @@ std::vector<std::string> readLines(const std::filesystem::path& path)
 void testAsyncFifoAndLifecycle()
 {
     const auto path = outputDirectory / "fifo.csv";
-    camera::Writer writer;
-    require(writer.init(path, camera::Writer::Format::Csv, 16), "Async CSV init должен пройти");
+    camera::VideoWriter writer;
+    require(writer.init(path, camera::VideoWriter::Options{camera::VideoWriter::Format::Csv, 16, false}), "Async CSV init должен пройти");
     for (int id = 0; id < 10; ++id)
     {
         auto frame = makeFrame(id);
@@ -75,13 +81,13 @@ void testAsyncFifoAndLifecycle()
         writeRejected = true;
     }
     require(writeRejected, "Запись после finish должна отклоняться");
-    require(!writer.init(path, camera::Writer::Format::Csv, 1), "Повторный init должен отклоняться");
+    require(!writer.init(path, camera::VideoWriter::Options{camera::VideoWriter::Format::Csv, 1, false}), "Повторный init должен отклоняться");
 }
 
 void testDefaultSynchronousMode()
 {
     const auto path = outputDirectory / "sync.csv";
-    camera::Writer writer;
+    camera::VideoWriter writer;
     require(writer.init(path), "Writer с queueDepth по умолчанию должен инициализироваться");
     writer.write(makeFrame(42));
     writer.finish();
@@ -93,8 +99,8 @@ void testDestructorDrainsAndJoins()
 {
     const auto path = outputDirectory / "destructor.csv";
     {
-        camera::Writer writer;
-        require(writer.init(path, camera::Writer::Format::Csv, 32), "Async CSV init для destructor должен пройти");
+        camera::VideoWriter writer;
+        require(writer.init(path, camera::VideoWriter::Options{camera::VideoWriter::Format::Csv, 32, false}), "Async CSV init для destructor должен пройти");
         for (int id = 0; id < 20; ++id)
         {
             writer.write(makeFrame(id));
@@ -112,8 +118,8 @@ void testDestructorDrainsAndJoins()
 void testAsyncMp4WorkerError()
 {
     const auto path = outputDirectory / "cpu_frame.mp4";
-    camera::Writer writer;
-    require(writer.init(path, camera::Writer::Format::H264Mp4, 2), "MP4 output должен открыться");
+    camera::VideoWriter writer;
+    require(writer.init(path, camera::VideoWriter::Options{camera::VideoWriter::Format::H264Mp4, 2, false}), "MP4 output должен открыться");
     writer.write(makeFrame(1));
 
     bool finishRejected = false;
@@ -142,8 +148,8 @@ void testAsyncMp4WorkerError()
 void testOverflowPreservesAcceptedFrames()
 {
     const auto path = outputDirectory / "overflow.csv";
-    camera::Writer writer;
-    require(writer.init(path, camera::Writer::Format::Csv, 1), "CSV init с малой очередью должен пройти");
+    camera::VideoWriter writer;
+    require(writer.init(path, camera::VideoWriter::Options{camera::VideoWriter::Format::Csv, 1, false}), "CSV init с малой очередью должен пройти");
 
     std::vector<int> accepted;
     bool overflowed = false;
@@ -193,6 +199,45 @@ void testOverflowPreservesAcceptedFrames()
         require(lines[index + 1] == std::to_string(id) + ",4,3", "После переполнения принятые кадры должны остаться в FIFO порядке");
     }
 }
+
+void testCpuMp4AndReconnectSegments()
+{
+    if (!avcodec_find_encoder_by_name("libx264"))
+    {
+        std::cout << "Skipping CPU MP4 checks: FFmpeg libx264 encoder is unavailable\n";
+        return;
+    }
+
+    const auto uniqueDirectory = outputDirectory / ("generation_" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(uniqueDirectory);
+    const auto basePath = uniqueDirectory / "generation.mp4";
+    camera::VideoWriter writer;
+    require(writer.init(basePath, camera::VideoWriter::Options{camera::VideoWriter::Format::H264Mp4, 8, false}),
+        "CPU MP4 output должен открыться");
+    for (std::uint64_t generation = 0; generation < 2; ++generation)
+    {
+        for (int index = 0; index < 3; ++index)
+        {
+            camera::Frame frame;
+            frame.image = cv::Mat(128, 128, CV_8UC3, cv::Scalar(20 + index, 80, 160));
+            frame.timestamp = std::chrono::microseconds(index * 40000);
+            frame.duration = std::chrono::microseconds(40000);
+            frame.streamGeneration = generation;
+            writer.write(frame);
+        }
+    }
+    writer.finish();
+
+    const auto paths = writer.outputPaths();
+    require(paths.size() == 2, "Reconnect должен создать два MP4 сегмента");
+    require(paths[0] == basePath, "Первый сегмент должен использовать исходный путь");
+    require(paths[1].filename() == "generation_session2.mp4", "Второй сегмент должен получить суффикс session2");
+    for (const auto& path : paths)
+    {
+        require(std::filesystem::file_size(path) > 0, "CPU MP4 segment должен содержать muxed output");
+    }
+}
 }
 
 int main()
@@ -205,6 +250,7 @@ int main()
         testDestructorDrainsAndJoins();
         testAsyncMp4WorkerError();
         testOverflowPreservesAcceptedFrames();
+        testCpuMp4AndReconnectSegments();
         std::cout << "Writer queue checks passed\n";
         return 0;
     }

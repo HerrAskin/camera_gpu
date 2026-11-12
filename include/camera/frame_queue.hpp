@@ -1,6 +1,6 @@
 #pragma once
 
-#include "camera/video.hpp"
+#include "camera/frame.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -30,6 +30,11 @@ public:
      */
     bool tryPush(Frame frame);
 
+    /** Ждёт освобождения места не дольше timeout; false означает timeout или закрытие.
+     * Отрицательный timeout отклоняется, уже добавленные кадры сохраняются.
+     */
+    bool waitPush(Frame frame, std::chrono::milliseconds timeout);
+
     /** Извлекает кадр; timeout=0 означает немедленный опрос. nullopt означает timeout
      * либо закрытую и опустевшую очередь; isClosed() позволяет различить эти случаи.
      */
@@ -52,6 +57,7 @@ private:
     std::deque<Frame> frames;
     mutable std::mutex mutex;
     std::condition_variable condition;
+    std::condition_variable spaceCondition;
     bool closed = false;
     std::size_t dropped = 0;
 };

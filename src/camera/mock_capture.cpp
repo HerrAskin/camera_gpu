@@ -1,30 +1,16 @@
-#include "camera/video.hpp"
-
+#include "camera/mock_capture.hpp"
 #include <opencv2/core.hpp>
-
-extern "C"
-{
-#include <libavutil/frame.h>
-}
 
 namespace camera
 {
-int Frame::width() const
-{
-    return gpuImage ? gpuImage->width : image.cols;
-}
-
-int Frame::height() const
-{
-    return gpuImage ? gpuImage->height : image.rows;
-}
-
 namespace
 {
-class MockVideo final : public Video
+class MockCapture final : public VideoCapture
 {
 public:
-    explicit MockVideo(std::size_t frameCount) : frameCount(frameCount) {}
+    explicit MockCapture(std::size_t frameCount) : frameCount(frameCount)
+    {
+    }
 
     std::string description() const override
     {
@@ -40,6 +26,7 @@ public:
         Frame frame;
         frame.image = cv::Mat(2, 4, CV_8UC1, cv::Scalar(42));
         frame.timestamp = std::chrono::microseconds(nextFrame * 40000);
+        frame.duration = std::chrono::microseconds(40000);
         ++nextFrame;
         return frame;
     }
@@ -55,9 +42,9 @@ private:
 };
 }
 
-std::unique_ptr<Video> createMockVideo(std::size_t frameCount)
+std::unique_ptr<VideoCapture> createMockCapture(std::size_t frameCount)
 {
-    return std::make_unique<MockVideo>(frameCount);
+    return std::make_unique<MockCapture>(frameCount);
 }
 
 }

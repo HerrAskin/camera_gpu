@@ -1,4 +1,4 @@
-#include "camera/file_video.hpp"
+#include "camera/video_capture.hpp"
 
 #include <arpa/inet.h>
 #include <chrono>
@@ -113,7 +113,7 @@ void requireElapsed(Clock::time_point start, std::chrono::milliseconds minimum, 
 void testTimeout()
 {
     TcpListener listener;
-    camera::FileVideo video;
+    camera::VideoCapture video;
     const auto start = Clock::now();
     require(!video.init(listener.url(), std::chrono::milliseconds(500)), "RTSP init должен завершиться по таймауту");
     requireElapsed(start, std::chrono::milliseconds(200), "RTSP init завершился раньше ожидаемого таймаута");
@@ -122,7 +122,7 @@ void testTimeout()
 void testRequestStop()
 {
     TcpListener listener;
-    camera::FileVideo video;
+    camera::VideoCapture video;
     const auto start = Clock::now();
     // Поток хранит ссылку на video, поэтому JoinThread гарантирует join до уничтожения объекта даже при исключении.
     JoinThread stopper(std::thread([&video]
@@ -138,7 +138,7 @@ void testRequestStop()
 
 void testInvalidTimeout()
 {
-    camera::FileVideo video;
+    camera::VideoCapture video;
     require(!video.init("rtsp://127.0.0.1:1/stream", std::chrono::milliseconds(0)), "Нулевой timeout должен быть отклонён");
 }
 }

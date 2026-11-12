@@ -49,6 +49,28 @@ bool FrameQueue::tryPush(Frame frame)
     return true;
 }
 
+bool FrameQueue::waitPush(Frame frame, std::chrono::milliseconds timeout)
+{
+    if (timeout < std::chrono::milliseconds::zero())
+    {
+        throw std::invalid_argument("Таймаут добавления не может быть отрицательным");
+    }
+
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!spaceCondition.wait_for(lock, timeout, [this]
+    {
+        return closed || frames.size() < capacity;
+    }) || closed)
+    {
+        return false;
+    }
+
+    frames.push_back(std::move(frame));
+    lock.unlock();
+    condition.notify_one();
+    return true;
+}
+
 std::optional<Frame> FrameQueue::pop(std::chrono::milliseconds timeout)
 {
     if (timeout < std::chrono::milliseconds::zero())
@@ -71,6 +93,8 @@ std::optional<Frame> FrameQueue::pop(std::chrono::milliseconds timeout)
 
     std::optional<Frame> result(std::move(frames.front()));
     frames.pop_front();
+    lock.unlock();
+    spaceCondition.notify_one();
     return result;
 }
 
@@ -81,6 +105,7 @@ void FrameQueue::close()
         closed = true;
     }
     condition.notify_all();
+    spaceCondition.notify_all();
 }
 
 std::size_t FrameQueue::size() const

@@ -10,10 +10,10 @@ find_package(OpenCV REQUIRED COMPONENTS core)
 cmake_policy(POP)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
-pkg_check_modules(FFmpeg REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil)
+pkg_check_modules(FFmpeg REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 
-add_library(camera_core src/camera/video.cpp src/camera/file_video.cpp src/camera/processor.cpp src/camera/writer.cpp src/camera/frame_queue.cpp)
-target_include_directories(camera_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
+add_library(camera_core src/camera/frame.cpp src/camera/mock_capture.cpp src/camera/video_capture.cpp src/camera/video_writer.cpp src/camera/frame_queue.cpp)
+target_include_directories(camera_core PUBLIC include ${OpenCV_INCLUDE_DIRS} ${FFmpeg_INCLUDE_DIRS})
 target_link_libraries(camera_core PUBLIC ${OpenCV_LIBS})
 target_link_libraries(camera_core PRIVATE PkgConfig::FFmpeg)
 target_link_libraries(camera_core PUBLIC Threads::Threads)
@@ -23,7 +23,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(camera_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(camera_demo apps/main.cpp)
+add_executable(camera_demo apps/main.cpp apps/arguments_parser.cpp apps/session.cpp apps/pipeline.cpp)
 target_link_libraries(camera_demo PRIVATE camera_core)
 
 include(CTest)
@@ -49,11 +49,14 @@ if(BUILD_TESTING)
         set_tests_properties(io_cancel PROPERTIES TIMEOUT 10)
     endif()
 
+    option(CAMERA_ENABLE_CPU_TESTS "Enable CPU-only FFmpeg integration tests" OFF)
     option(CAMERA_ENABLE_GPU_TESTS "Enable GPU-backed FFmpeg integration tests" OFF)
-    if(CAMERA_ENABLE_GPU_TESTS)
+    if(CAMERA_ENABLE_CPU_TESTS OR CAMERA_ENABLE_GPU_TESTS)
         find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
         find_program(FFMPEG_EXECUTABLE NAMES ffmpeg REQUIRED)
         find_program(FFPROBE_EXECUTABLE NAMES ffprobe REQUIRED)
+    endif()
+    if(CAMERA_ENABLE_GPU_TESTS)
         add_test(NAME gpu_pipeline
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_pipeline.py
                 --demo $<TARGET_FILE:camera_demo>
@@ -61,6 +64,24 @@ if(BUILD_TESTING)
                 --ffprobe ${FFPROBE_EXECUTABLE}
                 --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/tmp/gpu_pipeline_tests)
         set_tests_properties(gpu_pipeline PROPERTIES LABELS gpu TIMEOUT 120)
+    endif()
+    if(CAMERA_ENABLE_CPU_TESTS OR CAMERA_ENABLE_GPU_TESTS)
+        add_test(NAME cpu_pipeline
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cpu_pipeline.py
+                --demo $<TARGET_FILE:camera_demo>
+                --ffmpeg ${FFMPEG_EXECUTABLE}
+                --ffprobe ${FFPROBE_EXECUTABLE}
+                --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/tmp/cpu_pipeline_tests)
+        set_tests_properties(cpu_pipeline PROPERTIES LABELS cpu TIMEOUT 60)
+        add_test(NAME multi_source
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_multi_source.py
+                --demo $<TARGET_FILE:camera_demo>
+                --ffmpeg ${FFMPEG_EXECUTABLE}
+                --ffprobe ${FFPROBE_EXECUTABLE}
+                --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/tmp/multi_source_tests)
+        set_tests_properties(multi_source PROPERTIES LABELS cpu TIMEOUT 60)
+    endif()
+    if(CAMERA_ENABLE_GPU_TESTS)
         if(UNIX)
             add_test(NAME rtsp_faults
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rtsp_faults.py
